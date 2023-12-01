@@ -2,7 +2,7 @@ module github.com/endocrimes/nomadproxy
 
 go 1.21.1
 
-require tailscale.com v1.54.0
+require tailscale.com v1.54.1
 
 require (
 	filippo.io/edwards25519 v1.0.0 // indirect
