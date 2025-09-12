@@ -6,16 +6,17 @@ import (
 	"crypto/x509"
 	"flag"
 	"fmt"
-	"io/ioutil"
 	"log"
 	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"os"
 	"strings"
 	"time"
 
-	"tailscale.com/client/tailscale"
+	"tailscale.com/client/local"
+	"tailscale.com/client/tailscale/v2"
 	"tailscale.com/tsnet"
 	"tailscale.com/types/logger"
 )
@@ -25,12 +26,17 @@ var (
 	backendAddr       = flag.String("backend-addr", "", "Address of the Nomad server served over HTTPS, in scheme://host:port format. e.g http://localhost:4646.")
 	backendCA         = flag.String("backend-ca", "", "CA File of the backend")
 	backendClientCert = flag.String("backend-client-cert", "", "Client Cert File")
-	backendClientKey  = flag.String("backend-client-key", "", "Cleint Key File")
+	backendClientKey  = flag.String("backend-client-key", "", "Client Key File")
 	tailscaleDir      = flag.String("state-dir", "./", "Alternate directory to use for Tailscale state storage. If empty, a default is used.")
 	useHTTPS          = flag.Bool("use-https", true, "Serve over HTTPS via your *.ts.net subdomain if enabled in Tailscale admin.")
 )
 
 func main() {
+	var deviceTags []string
+	flag.Func("device-tag", "Tag for the Tailscale device, eg 'tag:prod'. Can be specified multiple times.", func(s string) error {
+		deviceTags = append(deviceTags, s)
+		return nil
+	})
 	flag.Parse()
 	if *hostname == "" || strings.Contains(*hostname, ".") {
 		log.Fatal("missing or invalid --hostname")
@@ -38,10 +44,27 @@ func main() {
 	if *backendAddr == "" {
 		log.Fatal("missing --backend-addr")
 	}
+
+	ctx := context.Background()
+
+	var authKey string
+	var err error
+	if authKey = os.Getenv("TS_AUTH_KEY"); authKey != "" {
+		log.Println("using TS_AUTH_KEY for authenticate the device")
+	} else {
+		log.Println("using OAuth client to authenticate the device")
+		oauthClient := newOauthClient()
+		authKey, err = createAuthKey(ctx, oauthClient, deviceTags)
+		if err != nil {
+			log.Fatalf("couldn't get an auth key via OAuth client: %v", err)
+		}
+	}
+
 	ts := &tsnet.Server{
 		Dir:      *tailscaleDir,
 		Hostname: *hostname,
 		Logf:     logger.Discard,
+		AuthKey:  authKey,
 	}
 
 	if err := ts.Start(); err != nil {
@@ -66,7 +89,7 @@ func main() {
 	proxy.ErrorLog = logger.StdLogger((logger.Discard))
 
 	if backendCA != nil && *backendCA != "" {
-		cert, err := ioutil.ReadFile(*backendCA)
+		cert, err := os.ReadFile(*backendCA)
 		if err != nil {
 			log.Fatalf("could not open certificate file: %v", err)
 		}
@@ -97,13 +120,13 @@ func main() {
 		go func() {
 			// wait for tailscale to start before trying to fetch cert names
 			for i := 0; i < 60; i++ {
-				st, err := localClient.Status(context.Background())
+				st, err := localClient.Status(ctx)
 				if err != nil {
 					log.Printf("error retrieving tailscale status; retrying: %v", err)
 				} else {
 					log.Printf("tailscale is %v", st.BackendState)
 					if st.BackendState == "Running" {
-						log.Println("tailscale is now runnning")
+						log.Println("tailscale is now running")
 						break
 					}
 				}
@@ -114,7 +137,7 @@ func main() {
 			if err != nil {
 				log.Fatal(err)
 			}
-			name, ok := localClient.ExpandSNIName(context.Background(), *hostname)
+			name, ok := localClient.ExpandSNIName(ctx, *hostname)
 			if !ok {
 				log.Fatalf("can't get hostname for https redirect")
 			}
@@ -132,12 +155,59 @@ func main() {
 	}
 
 	log.Printf("nomadproxy running at %v, proxying to %v", ln.Addr(), *backendAddr)
-	log.Fatal(http.Serve(ln, auditRequests(localClient, proxy)))
+	log.Fatal(http.Serve(ln, auditRequests(ctx, localClient, proxy)))
 }
 
-func auditRequests(client *tailscale.LocalClient, next http.Handler) http.HandlerFunc {
+func newOauthClient() *tailscale.Client {
+	tailnet := os.Getenv("TAILNET_NAME")
+	clientID := os.Getenv("TS_OAUTH_CLIENT_ID")
+	clientSecret := os.Getenv("TS_OAUTH_CLIENT_SECRET")
+
+	if tailnet == "" || clientID == "" || clientSecret == "" {
+		log.Fatal("missing OAuth client configuration (TAILNET_NAME, TS_OAUTH_CLIENT_ID, TS_OAUTH_CLIENT_SECRET)")
+	}
+
+	return &tailscale.Client{
+		Tailnet: tailnet,
+		HTTP: tailscale.OAuthConfig{
+			ClientID:     clientID,
+			ClientSecret: clientSecret,
+			Scopes:       []string{"auth_keys:write"},
+		}.HTTPClient(),
+	}
+}
+
+func createAuthKey(ctx context.Context, client *tailscale.Client, tags []string) (string, error) {
+	req := tailscale.CreateKeyRequest{
+		Capabilities: tailscale.KeyCapabilities{
+			Devices: struct {
+				Create struct {
+					Reusable      bool     `json:"reusable"`
+					Ephemeral     bool     `json:"ephemeral"`
+					Tags          []string `json:"tags"`
+					Preauthorized bool     `json:"preauthorized"`
+				} `json:"create"`
+			}{},
+		},
+		ExpirySeconds: 60,
+	}
+
+	req.Capabilities.Devices.Create.Ephemeral = true
+	req.Capabilities.Devices.Create.Reusable = false
+	req.Capabilities.Devices.Create.Preauthorized = false
+	req.Capabilities.Devices.Create.Tags = tags
+
+	keyMeta, err := client.Keys().Create(ctx, req)
+	if err != nil {
+		return "", err
+	}
+
+	return keyMeta.Key, nil
+}
+
+func auditRequests(ctx context.Context, client *local.Client, next http.Handler) http.HandlerFunc {
 	return func(resp http.ResponseWriter, req *http.Request) {
-		err := auditRequest(client, req)
+		err := auditRequest(ctx, client, req)
 		if err != nil {
 			resp.WriteHeader(500)
 			resp.Write([]byte("request audit failed"))
@@ -148,8 +218,8 @@ func auditRequests(client *tailscale.LocalClient, next http.Handler) http.Handle
 	}
 }
 
-func auditRequest(client *tailscale.LocalClient, req *http.Request) error {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+func auditRequest(ctx context.Context, client *local.Client, req *http.Request) error {
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 
 	whois, err := client.WhoIs(ctx, req.RemoteAddr)
