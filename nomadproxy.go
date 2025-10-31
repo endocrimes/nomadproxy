@@ -178,24 +178,16 @@ func newOauthClient() *tailscale.Client {
 }
 
 func createAuthKey(ctx context.Context, client *tailscale.Client, tags []string) (string, error) {
+	capabilities := tailscale.KeyCapabilities{}
+	capabilities.Devices.Create.Ephemeral = true
+	capabilities.Devices.Create.Reusable = false
+	capabilities.Devices.Create.Preauthorized = false
+	capabilities.Devices.Create.Tags = tags
+
 	req := tailscale.CreateKeyRequest{
-		Capabilities: tailscale.KeyCapabilities{
-			Devices: struct {
-				Create struct {
-					Reusable      bool     `json:"reusable"`
-					Ephemeral     bool     `json:"ephemeral"`
-					Tags          []string `json:"tags"`
-					Preauthorized bool     `json:"preauthorized"`
-				} `json:"create"`
-			}{},
-		},
+		Capabilities:  capabilities,
 		ExpirySeconds: 60,
 	}
-
-	req.Capabilities.Devices.Create.Ephemeral = true
-	req.Capabilities.Devices.Create.Reusable = false
-	req.Capabilities.Devices.Create.Preauthorized = false
-	req.Capabilities.Devices.Create.Tags = tags
 
 	keyMeta, err := client.Keys().Create(ctx, req)
 	if err != nil {
